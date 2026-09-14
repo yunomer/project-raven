@@ -8,6 +8,7 @@ import {
   buildSdkUploadBody,
   assemblyaiSupportsLanguage,
   parseSttProviderPreference,
+  effectiveSttEngine,
 } from '../transcriptProviderRouting'
 
 describe('pickTranscriptProvider', () => {
@@ -113,6 +114,15 @@ describe('chooseNativeSttStrategy', () => {
       preferredProvider: 'assemblyai',
     })).toBe('deepgram')
   })
+
+  it('routes explicit OpenAI through the direct native transcription slot', () => {
+    expect(chooseNativeSttStrategy({
+      language: 'en',
+      hasAssemblyKey: false,
+      hasDeepgramKey: false,
+      preferredProvider: 'openai',
+    })).toBe('deepgram')
+  })
 })
 
 describe('assemblyaiSupportsLanguage', () => {
@@ -125,10 +135,22 @@ describe('assemblyaiSupportsLanguage', () => {
 })
 
 describe('parseSttProviderPreference', () => {
-  it('defaults unknown values to auto', () => {
+  it('accepts supported providers and defaults unknown values to auto', () => {
     expect(parseSttProviderPreference('deepgram')).toBe('deepgram')
+    expect(parseSttProviderPreference('openai')).toBe('openai')
     expect(parseSttProviderPreference('nope')).toBe('auto')
     expect(parseSttProviderPreference(undefined)).toBe('auto')
+  })
+})
+
+describe('effectiveSttEngine', () => {
+  it('reports OpenAI when it is explicitly selected', () => {
+    expect(effectiveSttEngine({
+      language: 'en',
+      hasAssemblyKey: false,
+      hasDeepgramKey: false,
+      preferredProvider: 'openai',
+    })).toBe('openai')
   })
 })
 

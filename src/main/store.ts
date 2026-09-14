@@ -46,7 +46,7 @@ export interface LocalSettings {
   openOnLogin: boolean;
   transcriptionLanguage: string;
   /** Which STT engine to try. `auto` follows language routing. */
-  sttProvider: 'auto' | 'assemblyai' | 'deepgram';
+  sttProvider: 'auto' | 'assemblyai' | 'deepgram' | 'openai';
   outputLanguage: string;
   // User's custom vocabulary for transcription (comma-separated string
   // stored locally, parsed into string[] when passed to the backend as
@@ -299,7 +299,9 @@ export function saveApiKeys(
 }
 
 export function hasApiKeys(): boolean {
-  const hasStt = !!getApiKey('deepgramApiKey') || !!getApiKey('assemblyaiApiKey');
+  const sttProvider = store.get('sttProvider') || 'auto';
+  const hasOpenAiStt = sttProvider === 'openai' && !!getApiKey('openaiApiKey');
+  const hasStt = !!getApiKey('deepgramApiKey') || !!getApiKey('assemblyaiApiKey') || hasOpenAiStt;
   const provider = store.get('aiProvider') || 'anthropic';
   const hasAiKey = provider === 'openai'
     ? !!getApiKey('openaiApiKey')

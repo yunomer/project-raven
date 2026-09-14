@@ -1,530 +1,464 @@
 /**
- * TranscriptionService - main process.
- * Opens a WebSocket to Deepgram, streams audio chunks, receives transcript events.
- * Emits transcript updates to the overlay window.
+ * TranscriptionService - native-capture STT coordinator.
+ *
+ * Deepgram remains the default direct provider. When the user explicitly
+ * selects OpenAI in Settings this class delegates the same Raven provider
+ * interface to OpenAITranscriptionService, keeping AudioManager unchanged.
  */
 
-import { BrowserWindow } from 'electron';
-import type WebSocket from 'ws';
-import { sessionManager } from './services/sessionManager';
-import { getSetting } from './store';
-import { createLogger } from './logger';
-import { AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, DEEPGRAM_KEEPALIVE_MS, DEEPGRAM_ENDPOINTING_MS, DEEPGRAM_UTTERANCE_END_MS, TRANSCRIPT_MERGE_WINDOW_MS, TRANSCRIPT_FLUSH_TIMEOUT_MS } from './constants';
+import { BrowserWindow } from 'electron'
+import type WebSocket from 'ws'
+import { sessionManager } from './services/sessionManager'
+import { getSetting } from './store'
+import { createLogger } from './logger'
+import { parseSttProviderPreference } from '../shared/sttCapabilities'
+import { OpenAITranscriptionService } from './services/openAITranscriptionService'
+import {
+  AUDIO_SAMPLE_RATE,
+  AUDIO_CHANNELS,
+  DEEPGRAM_KEEPALIVE_MS,
+  DEEPGRAM_ENDPOINTING_MS,
+  DEEPGRAM_UTTERANCE_END_MS,
+  TRANSCRIPT_MERGE_WINDOW_MS,
+  TRANSCRIPT_FLUSH_TIMEOUT_MS,
+} from './constants'
 
-const log = createLogger('Transcription');
+const log = createLogger('Transcription')
+const DEEPGRAM_WS_BASE = 'wss://api.deepgram.com/v1/listen'
 
-const DEEPGRAM_WS_BASE = 'wss://api.deepgram.com/v1/listen';
-
-type AudioSource = 'mic' | 'system';
+type AudioSource = 'mic' | 'system'
 
 interface TranscriptEntry {
-  id: string;
-  source: AudioSource;
-  text: string;
-  speaker: 'you' | 'them';
-  timestamp: number;
-  isFinal: boolean;
+  id: string
+  source: AudioSource
+  text: string
+  speaker: 'you' | 'them'
+  timestamp: number
+  isFinal: boolean
 }
-
-const RECONNECT_BUFFER_MAX_CHUNKS = 50;
 
 interface ConnectionState {
-  ws: WebSocket | null;
-  isConnected: boolean;
-  keepAliveInterval: NodeJS.Timeout | null;
-  currentInterim: string;
-  sendCount?: number;
-  reconnectAttempts?: number;
-  pendingAudio?: Buffer[];
+  ws: WebSocket | null
+  isConnected: boolean
+  keepAliveInterval: NodeJS.Timeout | null
+  currentInterim: string
+  sendCount: number
+  reconnectAttempts: number
+  pendingAudio: Buffer[]
 }
 
-const MAX_RECONNECT_ATTEMPTS = 3;
-const RECONNECT_DELAY_MS = 1000;
-const MAX_TRANSCRIPT_ENTRIES = 5000;
+const RECONNECT_BUFFER_MAX_CHUNKS = 50
+const MAX_RECONNECT_ATTEMPTS = 3
+const RECONNECT_DELAY_MS = 1000
+const MAX_TRANSCRIPT_ENTRIES = 5000
+
+function newConnectionState(): ConnectionState {
+  return {
+    ws: null,
+    isConnected: false,
+    keepAliveInterval: null,
+    currentInterim: '',
+    sendCount: 0,
+    reconnectAttempts: 0,
+    pendingAudio: [],
+  }
+}
 
 export class TranscriptionService {
-  private micConnection: ConnectionState = { ws: null, isConnected: false, keepAliveInterval: null, currentInterim: '', sendCount: 0, reconnectAttempts: 0 };
-  private systemConnection: ConnectionState = { ws: null, isConnected: false, keepAliveInterval: null, currentInterim: '', sendCount: 0, reconnectAttempts: 0 };
-  private overlayWindow: BrowserWindow | null = null;
-  private dashboardWindow: BrowserWindow | null = null;
-  private apiKey: string = '';
-  private transcriptEntries: TranscriptEntry[] = [];
-  private isActive = false;
+  private micConnection = newConnectionState()
+  private systemConnection = newConnectionState()
+  private overlayWindow: BrowserWindow | null = null
+  private dashboardWindow: BrowserWindow | null = null
+  private apiKey = ''
+  private transcriptEntries: TranscriptEntry[] = []
+  private isActive = false
+  private reconnecting = new Set<AudioSource>()
+  private openaiDelegate: OpenAITranscriptionService | null = null
+  private activeEngine: 'deepgram' | 'openai' = 'deepgram'
 
   setWindows(dashboard: BrowserWindow | null, overlay: BrowserWindow | null): void {
-    this.dashboardWindow = dashboard;
-    this.overlayWindow = overlay;
+    this.dashboardWindow = dashboard
+    this.overlayWindow = overlay
+    this.openaiDelegate?.setWindows(dashboard, overlay)
   }
 
   setApiKey(key: string): void {
-    this.apiKey = key;
+    this.apiKey = key
   }
 
   async start(): Promise<{ success: boolean; error?: string }> {
-    if (!this.apiKey) {
-      log.error('No Deepgram API key!');
-      return { success: false, error: 'No Deepgram API key configured' };
+    const preference = parseSttProviderPreference(getSetting('sttProvider'))
+    if (preference === 'openai') {
+      this.activeEngine = 'openai'
+      if (!this.openaiDelegate) this.openaiDelegate = new OpenAITranscriptionService()
+      this.openaiDelegate.setWindows(this.dashboardWindow, this.overlayWindow)
+      this.openaiDelegate.setApiKey((getSetting('openaiApiKey') as string) || '')
+      this.openaiDelegate.clearTranscript()
+      log.info('Starting OpenAI gpt-live-transcribe for native capture')
+      return await this.openaiDelegate.start()
     }
 
-    log.info('Starting both connections...');
-    this.isActive = true;
+    this.activeEngine = 'deepgram'
+    if (!this.apiKey) {
+      log.error('No Deepgram API key!')
+      return { success: false, error: 'No Deepgram API key configured' }
+    }
 
+    log.info('Starting Deepgram connections...')
+    this.isActive = true
     const [micResult, systemResult] = await Promise.all([
       this.startConnection('mic'),
       this.startConnection('system'),
-    ]);
-
-    log.info(
-      `Connection results - Mic: ${micResult.success}, System: ${systemResult.success}`
-    );
+    ])
 
     if (!micResult.success && !systemResult.success) {
-      this.isActive = false;
-      return { success: false, error: 'Failed to start transcription' };
+      this.isActive = false
+      return { success: false, error: 'Failed to start transcription' }
     }
+    return { success: true }
+  }
 
-    return { success: true };
+  private stateFor(source: AudioSource): ConnectionState {
+    return source === 'mic' ? this.micConnection : this.systemConnection
   }
 
   private async startConnection(source: AudioSource): Promise<{ success: boolean }> {
-    const state = source === 'mic' ? this.micConnection : this.systemConnection;
-
-    if (state.isConnected) {
-      log.debug(`${source} already connected`);
-      return { success: true };
-    }
+    const state = this.stateFor(source)
+    if (state.isConnected) return { success: true }
 
     try {
-      const { default: WebSocketModule } = await import('ws');
-
-      const transcriptionLanguage = (getSetting('transcriptionLanguage') as string) || 'en';
-
+      const { default: WebSocketModule } = await import('ws')
+      const transcriptionLanguage = (getSetting('transcriptionLanguage') as string) || 'en'
       const params = new URLSearchParams({
         model: 'nova-3',
         language: transcriptionLanguage,
         smart_format: 'true',
         interim_results: 'true',
         punctuate: 'true',
-        // Diarize is unused for You/Them: those labels are capture
-        // source (mic vs system), not Deepgram speaker_id. A pause on
-        // the same person mints a new id and used to flip You → Them.
         diarize: 'false',
         sample_rate: String(AUDIO_SAMPLE_RATE),
         channels: String(AUDIO_CHANNELS),
         encoding: 'linear16',
         endpointing: String(DEEPGRAM_ENDPOINTING_MS),
         utterance_end_ms: String(DEEPGRAM_UTTERANCE_END_MS),
-      });
+      })
 
-      // Inject keyterms (brand name + user vocabulary) for nova-3's
-      // Keyword Prompting feature. Free-tier path talks directly to
-      // Deepgram so we can't share the backend's sanitizer - replicate
-      // the mandatory-"Raven"-first + dedupe + 100-cap contract here.
-      const vocabString = (getSetting('vocabulary' as keyof import('./store').LocalSettings) as string) || '';
-      const userTerms = vocabString.split(',').map((t) => t.trim()).filter((t) => t.length > 0);
-      const seen = new Set<string>();
-      const finalTerms: string[] = [];
+      const vocabString = (getSetting('vocabulary') as string) || ''
+      const userTerms = vocabString.split(',').map((t) => t.trim()).filter(Boolean)
+      const seen = new Set<string>()
+      const finalTerms: string[] = []
       for (const term of ['Raven', ...userTerms]) {
-        const key = term.toLowerCase();
-        if (seen.has(key)) continue;
-        seen.add(key);
-        finalTerms.push(term);
-        if (finalTerms.length >= 100) break;
+        const key = term.toLowerCase()
+        if (seen.has(key)) continue
+        seen.add(key)
+        finalTerms.push(term)
+        if (finalTerms.length >= 100) break
       }
-      // URLSearchParams repeats a key for each appended value - which is
-      // exactly how Deepgram wants `keyterms` passed.
-      for (const term of finalTerms) params.append('keyterms', term);
+      for (const term of finalTerms) params.append('keyterms', term)
 
-      const url = `${DEEPGRAM_WS_BASE}?${params.toString()}`;
-
-      state.ws = new WebSocketModule(url, {
+      state.ws = new WebSocketModule(`${DEEPGRAM_WS_BASE}?${params.toString()}`, {
         headers: { Authorization: `Token ${this.apiKey}` },
-      }) as WebSocket;
+      }) as WebSocket
 
-      return new Promise((resolve) => {
-        const connectionTimeout = setTimeout(() => {
-          log.error(`${source} WebSocket connection timed out after 10s`);
-          try { state.ws?.close(); } catch { /* already-closed, ignore */ }
-          resolve({ success: false });
-        }, 10_000);
+      return await new Promise((resolve) => {
+        let settled = false
+        const finish = (value: { success: boolean }) => {
+          if (settled) return
+          settled = true
+          resolve(value)
+        }
+        const timeout = setTimeout(() => {
+          log.error(`${source} Deepgram WebSocket connection timed out after 10s`)
+          try { state.ws?.close() } catch { /* ignore */ }
+          finish({ success: false })
+        }, 10_000)
 
         state.ws!.onopen = () => {
-          clearTimeout(connectionTimeout);
-          log.info(`${source} WebSocket connected`);
-          state.isConnected = true;
-
+          clearTimeout(timeout)
+          state.isConnected = true
+          state.reconnectAttempts = 0
           state.keepAliveInterval = setInterval(() => {
-            if (state.ws && state.isConnected) {
-              try {
-                state.ws.send(JSON.stringify({ type: 'KeepAlive' }));
-              } catch (err) {
-                log.error(`${source} keep-alive error:`, err);
-              }
+            if (!state.ws || !state.isConnected) return
+            try { state.ws.send(JSON.stringify({ type: 'KeepAlive' })) } catch (err) {
+              log.error(`${source} keep-alive error:`, err)
             }
-          }, DEEPGRAM_KEEPALIVE_MS);
-
-          this.broadcastStatus(`${source}-connected`);
-          resolve({ success: true });
-        };
+          }, DEEPGRAM_KEEPALIVE_MS)
+          this.broadcastStatus(`${source}-connected`)
+          finish({ success: true })
+        }
 
         state.ws!.onmessage = (event: { data: unknown }) => {
           try {
-            const data = JSON.parse(typeof event.data === 'string' ? event.data : String(event.data));
-            
-            log.debug(`${source} received:`, JSON.stringify(data).slice(0, 200));
-            
-            this.handleTranscriptResult(data, source);
+            const data = JSON.parse(typeof event.data === 'string' ? event.data : String(event.data))
+            this.handleTranscriptResult(data, source)
           } catch (err) {
-            log.error(`${source} parse error:`, err);
+            log.error(`${source} Deepgram parse error:`, err)
           }
-        };
+        }
 
         state.ws!.onerror = (event: { message?: string }) => {
-          clearTimeout(connectionTimeout);
-          log.error(`${source} WebSocket error:`, event.message || event);
-          resolve({ success: false });
-        };
+          clearTimeout(timeout)
+          log.error(`${source} Deepgram WebSocket error:`, event.message || event)
+          finish({ success: false })
+        }
 
         state.ws!.onclose = (event: { code?: number; reason?: string }) => {
-          const code = event?.code ?? 'unknown';
-          const reason = event?.reason ?? 'no reason';
-          log.warn(`${source} WebSocket closed (code=${code}, reason="${reason}", sends=${state.sendCount || 0})`);
-          state.isConnected = false;
-          this.clearKeepAlive(state);
-
-          // Reconnect if session is still active and this was unexpected
-          if (this.isActive && code !== 1000) {
-            this.attemptReconnect(source);
-          }
-        };
-      });
-    } catch (err: unknown) {
-      log.error(`${source} failed to connect:`, err);
-      return { success: false };
+          clearTimeout(timeout)
+          const code = event?.code ?? 'unknown'
+          const reason = event?.reason ?? 'no reason'
+          log.warn(`${source} Deepgram WebSocket closed (code=${code}, reason="${reason}")`)
+          state.isConnected = false
+          state.ws = null
+          this.clearKeepAlive(state)
+          if (this.isActive && code !== 1000) void this.attemptReconnect(source)
+        }
+      })
+    } catch (err) {
+      log.error(`${source} failed to connect to Deepgram:`, err)
+      return { success: false }
     }
   }
 
-  private reconnecting = new Set<AudioSource>();
-
   private async attemptReconnect(source: AudioSource): Promise<void> {
-    if (this.reconnecting.has(source)) return;
-    this.reconnecting.add(source);
-
-    const state = source === 'mic' ? this.micConnection : this.systemConnection;
-    state.reconnectAttempts = (state.reconnectAttempts || 0) + 1;
+    if (this.reconnecting.has(source)) return
+    this.reconnecting.add(source)
+    const state = this.stateFor(source)
+    state.reconnectAttempts++
 
     if (state.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-      log.error(`${source} exceeded max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}), giving up`);
-      this.reconnecting.delete(source);
-      this.broadcastStatus(`${source}-disconnected`);
-      return;
+      log.error(`${source} exceeded max Deepgram reconnect attempts`)
+      this.reconnecting.delete(source)
+      this.broadcastStatus(`${source}-disconnected`)
+      return
     }
 
-    const delay = RECONNECT_DELAY_MS * state.reconnectAttempts;
-    log.info(`${source} reconnecting in ${delay}ms (attempt ${state.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
-
-    await new Promise(resolve => setTimeout(resolve, delay));
-
+    await new Promise((resolve) => setTimeout(resolve, RECONNECT_DELAY_MS * state.reconnectAttempts))
     if (!this.isActive) {
-      log.debug(`${source} session ended during reconnect wait, aborting`);
-      this.reconnecting.delete(source);
-      return;
+      this.reconnecting.delete(source)
+      return
     }
 
-    state.sendCount = 0;
-    const result = await this.startConnection(source);
-    this.reconnecting.delete(source);
-    if (result.success) {
-      log.info(`${source} reconnected successfully`);
-      state.reconnectAttempts = 0;
-    } else {
-      log.error(`${source} reconnect failed`);
-      this.attemptReconnect(source);
-    }
+    state.sendCount = 0
+    const result = await this.startConnection(source)
+    this.reconnecting.delete(source)
+    if (!result.success && this.isActive) void this.attemptReconnect(source)
   }
 
   private handleTranscriptResult(
-    data: {
-      channel?: {
-        alternatives?: Array<{
-          transcript?: string
-          words?: Array<{ speaker?: number }>
-        }>
-      }
-      is_final?: boolean
-    },
+    data: { channel?: { alternatives?: Array<{ transcript?: string }> }; is_final?: boolean },
     source: AudioSource,
   ): void {
-    log.debug(`handleTranscriptResult called for ${source}`);
-    
-    const transcript = data.channel?.alternatives?.[0]?.transcript;
-    if (!transcript) {
-      log.debug(`${source} - no transcript in message`);
-      return;
-    }
-
-    log.debug(`${source} transcript: "${transcript}" (final: ${data.is_final})`);
-
-    const isFinal = !!data.is_final;
-    const state = source === 'mic' ? this.micConnection : this.systemConnection;
-
-    // You = mic capture, Them = system-audio capture. Deepgram
-    // speaker_id is ignored: a pause on the same talker often mints a
-    // new id, which used to retag the rest of the user's sentence as Them.
-    const speaker: 'you' | 'them' = source === 'mic' ? 'you' : 'them';
-
-    if (isFinal) {
-      const now = Date.now();
-
-      const lastEntry = this.transcriptEntries[this.transcriptEntries.length - 1];
-      const shouldMerge = lastEntry
-        && lastEntry.speaker === speaker
-        && (now - lastEntry.timestamp) < TRANSCRIPT_MERGE_WINDOW_MS;
-
-      if (shouldMerge && lastEntry) {
-        lastEntry.text = `${lastEntry.text} ${transcript}`;
-        lastEntry.timestamp = now;
-      } else {
-        if (this.transcriptEntries.length >= MAX_TRANSCRIPT_ENTRIES) {
-          const dropped = this.transcriptEntries.length - Math.floor(MAX_TRANSCRIPT_ENTRIES * 0.8);
-          log.warn(`Transcript cap reached (${MAX_TRANSCRIPT_ENTRIES}) - dropping ${dropped} oldest entries`);
-          this.transcriptEntries = this.transcriptEntries.slice(-Math.floor(MAX_TRANSCRIPT_ENTRIES * 0.8));
-        }
-        const entry: TranscriptEntry = {
-          id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-          source,
-          text: transcript,
-          speaker,
-          timestamp: now,
-          isFinal: true,
-        };
-        this.transcriptEntries.push(entry);
-      }
-
-      state.currentInterim = '';
-
-      const latestEntry = this.transcriptEntries[this.transcriptEntries.length - 1];
-      sessionManager.addTranscriptEntry({
-        id: latestEntry.id,
-        source: latestEntry.source,
-        text: latestEntry.text,
-        timestamp: latestEntry.timestamp,
-        isFinal: latestEntry.isFinal,
-      });
-
-      this.broadcastTranscript({
-        entry: this.transcriptEntries[this.transcriptEntries.length - 1],
-        isFinal: true,
-        fullTranscript: this.getFullTranscriptText(),
-      });
-    } else {
-      state.currentInterim = transcript;
-
-      sessionManager.addTranscriptEntry({
-        id: `interim-${source}`,
-        source,
-        text: transcript,
-        timestamp: Date.now(),
-        isFinal: false,
-      });
-
-      this.broadcastTranscript({
-        entry: {
-          id: `interim-${source}`,
-          source,
-          text: transcript,
-          speaker,
-          timestamp: Date.now(),
-          isFinal: false,
-        },
-        isFinal: false,
-        fullTranscript: this.getFullTranscriptText(),
-        interims: {
-          mic: this.micConnection.currentInterim,
-          system: this.systemConnection.currentInterim,
-        },
-      });
+    const transcript = data.channel?.alternatives?.[0]?.transcript
+    if (!transcript) return
+    const state = this.stateFor(source)
+    if (data.is_final) this.handleFinalTranscript(transcript, source)
+    else {
+      state.currentInterim = transcript
+      this.handleInterimTranscript(transcript, source)
     }
   }
 
-  /**
-   * Send audio data to the appropriate Deepgram connection.
-   */
-  sendAudio(buffer: Buffer | ArrayBuffer, source: AudioSource): void {
-    const state = source === 'mic' ? this.micConnection : this.systemConnection;
-    const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+  private handleFinalTranscript(text: string, source: AudioSource): void {
+    const speaker: 'you' | 'them' = source === 'mic' ? 'you' : 'them'
+    const now = Date.now()
+    const state = this.stateFor(source)
+    const lastEntry = this.transcriptEntries[this.transcriptEntries.length - 1]
+    const shouldMerge = lastEntry
+      && lastEntry.speaker === speaker
+      && (now - lastEntry.timestamp) < TRANSCRIPT_MERGE_WINDOW_MS
 
-    if (!state.ws || !state.isConnected) {
-      if (!state.pendingAudio) state.pendingAudio = [];
-      if (state.pendingAudio.length < RECONNECT_BUFFER_MAX_CHUNKS) {
-        state.pendingAudio.push(buf);
+    if (shouldMerge && lastEntry) {
+      lastEntry.text = `${lastEntry.text} ${text}`
+      lastEntry.timestamp = now
+    } else {
+      if (this.transcriptEntries.length >= MAX_TRANSCRIPT_ENTRIES) {
+        this.transcriptEntries = this.transcriptEntries.slice(-Math.floor(MAX_TRANSCRIPT_ENTRIES * 0.8))
       }
-      return;
+      this.transcriptEntries.push({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        source,
+        text,
+        speaker,
+        timestamp: now,
+        isFinal: true,
+      })
     }
 
-    // Flush any buffered audio from a recent reconnect
-    if (state.pendingAudio && state.pendingAudio.length > 0) {
-      log.info(`${source} flushing ${state.pendingAudio.length} buffered chunks after reconnect`);
-      for (const pending of state.pendingAudio) {
-        try { state.ws.send(pending); } catch { break; }
+    state.currentInterim = ''
+    const latestEntry = this.transcriptEntries[this.transcriptEntries.length - 1]
+    sessionManager.addTranscriptEntry({
+      id: latestEntry.id,
+      source: latestEntry.source,
+      text: latestEntry.text,
+      timestamp: latestEntry.timestamp,
+      isFinal: true,
+    })
+    this.broadcastTranscript({ entry: latestEntry, isFinal: true, fullTranscript: this.getFullTranscriptText() })
+  }
+
+  private handleInterimTranscript(text: string, source: AudioSource): void {
+    const speaker: 'you' | 'them' = source === 'mic' ? 'you' : 'them'
+    sessionManager.addTranscriptEntry({
+      id: `interim-${source}`,
+      source,
+      text,
+      timestamp: Date.now(),
+      isFinal: false,
+    })
+    this.broadcastTranscript({
+      entry: { id: `interim-${source}`, source, text, speaker, timestamp: Date.now(), isFinal: false },
+      isFinal: false,
+      fullTranscript: this.getFullTranscriptText(),
+      interims: { mic: this.micConnection.currentInterim, system: this.systemConnection.currentInterim },
+    })
+  }
+
+  sendAudio(buffer: Buffer | ArrayBuffer, source: AudioSource): void {
+    if (this.activeEngine === 'openai' && this.openaiDelegate) {
+      this.openaiDelegate.sendAudio(buffer, source)
+      return
+    }
+
+    const state = this.stateFor(source)
+    const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer)
+    if (!state.ws || !state.isConnected) {
+      if (state.pendingAudio.length < RECONNECT_BUFFER_MAX_CHUNKS) state.pendingAudio.push(Buffer.from(buf))
+      return
+    }
+
+    if (state.pendingAudio.length > 0) {
+      const pending = state.pendingAudio.splice(0)
+      for (const chunk of pending) {
+        try { state.ws.send(chunk) } catch { break }
       }
-      state.pendingAudio = [];
     }
 
     try {
-      state.sendCount = (state.sendCount || 0) + 1;
-      if (state.sendCount <= 5 || state.sendCount % 200 === 0) {
-        const samples = new Int16Array(buf.buffer, buf.byteOffset, Math.min(10, buf.byteLength / 2));
-        const maxVal = samples.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
-        log.debug(`${source} send #${state.sendCount}: ${buf.byteLength} bytes, first10max=${maxVal}, first5=[${Array.from(samples).slice(0, 5)}]`);
-      }
-      state.ws.send(buf);
+      state.sendCount++
+      state.ws.send(buf)
     } catch (err) {
-      log.error(`${source} send error:`, err);
+      log.error(`${source} Deepgram send error:`, err)
     }
   }
 
   async stop(): Promise<void> {
-    this.isActive = false;
+    if (this.activeEngine === 'openai' && this.openaiDelegate) {
+      await this.openaiDelegate.stop()
+      return
+    }
+
+    this.isActive = false
     await Promise.all([
       this.stopConnection(this.micConnection),
       this.stopConnection(this.systemConnection),
-    ]);
-    this.micConnection.reconnectAttempts = 0;
-    this.systemConnection.reconnectAttempts = 0;
-    log.info('All connections stopped');
+    ])
+    this.micConnection.reconnectAttempts = 0
+    this.systemConnection.reconnectAttempts = 0
   }
 
   private async stopConnection(state: ConnectionState): Promise<void> {
-    this.clearKeepAlive(state);
-
+    this.clearKeepAlive(state)
     if (state.ws) {
       try {
         if (state.isConnected) {
-          state.ws.send(JSON.stringify({ type: 'CloseStream' }));
-
+          state.ws.send(JSON.stringify({ type: 'CloseStream' }))
           await new Promise<void>((resolve) => {
             const timeout = setTimeout(() => {
-              log.warn('Flush timeout reached, force closing');
-              try { state.ws?.close(); } catch { /* already-closed, ignore */ }
-              resolve();
-            }, TRANSCRIPT_FLUSH_TIMEOUT_MS);
-
-            const origOnClose = state.ws!.onclose;
-            state.ws!.onclose = (ev) => {
-              clearTimeout(timeout);
-              if (typeof origOnClose === 'function') origOnClose.call(state.ws, ev);
-              resolve();
-            };
-          });
+              try { state.ws?.close() } catch { /* ignore */ }
+              resolve()
+            }, TRANSCRIPT_FLUSH_TIMEOUT_MS)
+            const originalOnClose = state.ws!.onclose
+            state.ws!.onclose = (event) => {
+              clearTimeout(timeout)
+              if (typeof originalOnClose === 'function') originalOnClose.call(state.ws, event)
+              resolve()
+            }
+          })
         } else {
-          state.ws.close();
+          state.ws.close()
         }
       } catch (err) {
-        log.error('Close error:', err);
-        try { state.ws?.close(); } catch { /* already-closed, ignore */ }
+        log.error('Deepgram close error:', err)
+        try { state.ws?.close() } catch { /* ignore */ }
       }
-      state.ws = null;
     }
-
-    state.isConnected = false;
-    state.currentInterim = '';
+    state.ws = null
+    state.isConnected = false
+    state.currentInterim = ''
   }
 
   getFullTranscript(): string {
-    return this.getFullTranscriptText();
+    if (this.activeEngine === 'openai' && this.openaiDelegate) return this.openaiDelegate.getFullTranscript()
+    return this.getFullTranscriptText()
   }
 
-  /**
-   * Returns finalized transcript PLUS any current interim (still-speaking) text.
-   * Interims are labeled so the LLM knows the speaker hasn't finished yet.
-   */
   getFullTranscriptWithInterims(): string {
-    let text = this.getFullTranscriptText();
-    const displayName = getSetting('displayName') || 'You';
-
-    if (this.systemConnection.currentInterim) {
-      text += `\nThem (still speaking): ${this.systemConnection.currentInterim}`;
-    }
-    if (this.micConnection.currentInterim) {
-      text += `\n${displayName} (still speaking): ${this.micConnection.currentInterim}`;
-    }
-
-    return text;
+    if (this.activeEngine === 'openai' && this.openaiDelegate) return this.openaiDelegate.getFullTranscriptWithInterims()
+    let text = this.getFullTranscriptText()
+    const displayName = (getSetting('displayName') as string) || 'You'
+    if (this.systemConnection.currentInterim) text += `\nThem (still speaking): ${this.systemConnection.currentInterim}`
+    if (this.micConnection.currentInterim) text += `\n${displayName} (still speaking): ${this.micConnection.currentInterim}`
+    return text
   }
 
   getTranscriptEntries(): TranscriptEntry[] {
-    return this.transcriptEntries;
-  }
-
-  private getFullTranscriptText(): string {
-    const displayName = getSetting('displayName') || 'You';
+    if (this.activeEngine === 'openai' && this.openaiDelegate) return this.openaiDelegate.getTranscriptEntries()
     return this.transcriptEntries
-      .map((e) => `${e.speaker === 'you' ? displayName : 'Them'}: ${e.text}`)
-      .join('\n');
   }
 
   getTranscriptBySource(source: 'mic' | 'system' | 'all'): string {
-    const displayName = getSetting('displayName') || 'You';
-    const filtered = source === 'all'
-      ? this.transcriptEntries
-      : this.transcriptEntries.filter(e => e.source === source);
-    return filtered
-      .map(e => `${e.speaker === 'you' ? displayName : 'Them'}: ${e.text}`)
-      .join('\n');
+    if (this.activeEngine === 'openai' && this.openaiDelegate) return this.openaiDelegate.getTranscriptBySource(source)
+    const displayName = (getSetting('displayName') as string) || 'You'
+    const filtered = source === 'all' ? this.transcriptEntries : this.transcriptEntries.filter((entry) => entry.source === source)
+    return filtered.map((entry) => `${entry.speaker === 'you' ? displayName : 'Them'}: ${entry.text}`).join('\n')
   }
 
   clearTranscript(): void {
-    this.transcriptEntries = [];
-    this.micConnection.currentInterim = '';
-    this.systemConnection.currentInterim = '';
+    if (this.activeEngine === 'openai' && this.openaiDelegate) {
+      this.openaiDelegate.clearTranscript()
+      return
+    }
+    this.transcriptEntries = []
+    this.micConnection.currentInterim = ''
+    this.systemConnection.currentInterim = ''
+  }
+
+  private getFullTranscriptText(): string {
+    const displayName = (getSetting('displayName') as string) || 'You'
+    return this.transcriptEntries.map((entry) => `${entry.speaker === 'you' ? displayName : 'Them'}: ${entry.text}`).join('\n')
   }
 
   private broadcastTranscript(data: {
-    entry: TranscriptEntry;
-    isFinal: boolean;
-    fullTranscript: string;
-    interims?: { mic: string; system: string };
+    entry: TranscriptEntry
+    isFinal: boolean
+    fullTranscript: string
+    interims?: { mic: string; system: string }
   }): void {
-    const payload = data;
-
     try {
-      if (this.overlayWindow && !this.overlayWindow.isDestroyed()) {
-        this.overlayWindow.webContents.send('transcription:update', payload);
-      }
+      if (this.overlayWindow && !this.overlayWindow.isDestroyed()) this.overlayWindow.webContents.send('transcription:update', data)
     } catch (err) {
-      log.error('Broadcast to overlay failed:', err);
+      log.error('Broadcast to overlay failed:', err)
     }
-
     try {
-      if (this.dashboardWindow && !this.dashboardWindow.isDestroyed()) {
-        this.dashboardWindow.webContents.send('transcription:update', payload);
-      }
+      if (this.dashboardWindow && !this.dashboardWindow.isDestroyed()) this.dashboardWindow.webContents.send('transcription:update', data)
     } catch (err) {
-      log.error('Broadcast to dashboard failed:', err);
+      log.error('Broadcast to dashboard failed:', err)
     }
   }
 
   private broadcastStatus(status: string): void {
-    const payload = { status };
-
+    const payload = { status }
     try {
-      if (this.overlayWindow && !this.overlayWindow.isDestroyed()) {
-        this.overlayWindow.webContents.send('transcription:status', payload);
-      }
-    } catch (err) { /* ignore */ }
-
+      if (this.overlayWindow && !this.overlayWindow.isDestroyed()) this.overlayWindow.webContents.send('transcription:status', payload)
+    } catch { /* ignore */ }
     try {
-      if (this.dashboardWindow && !this.dashboardWindow.isDestroyed()) {
-        this.dashboardWindow.webContents.send('transcription:status', payload);
-      }
-    } catch (err) { /* ignore */ }
+      if (this.dashboardWindow && !this.dashboardWindow.isDestroyed()) this.dashboardWindow.webContents.send('transcription:status', payload)
+    } catch { /* ignore */ }
   }
 
   private clearKeepAlive(state: ConnectionState): void {
-    if (state.keepAliveInterval) {
-      clearInterval(state.keepAliveInterval);
-      state.keepAliveInterval = null;
-    }
+    if (!state.keepAliveInterval) return
+    clearInterval(state.keepAliveInterval)
+    state.keepAliveInterval = null
   }
 }

@@ -1,7 +1,8 @@
 /**
  * STT engine pick shared by main (recording) and the Language settings UI.
  * AssemblyAI Universal-3 Pro realtime only covers six languages; Deepgram
- * nova-3 covers the rest, including auto-detect.
+ * nova-3 covers the rest, including auto-detect. OpenAI is an explicit
+ * opt-in provider and uses gpt-live-transcribe through the native capture path.
  */
 
 export const U3_RT_PRO_LANGUAGES = new Set(['en', 'es', 'fr', 'de', 'pt', 'it'])
@@ -15,10 +16,10 @@ export type TranscriptProviderConfig =
 
 export type NativeSttStrategy = 'assembly-retry' | 'deepgram' | 'none'
 
-export type SttProviderPreference = 'auto' | 'assemblyai' | 'deepgram'
+export type SttProviderPreference = 'auto' | 'assemblyai' | 'deepgram' | 'openai'
 
 export function parseSttProviderPreference(value: unknown): SttProviderPreference {
-  if (value === 'assemblyai' || value === 'deepgram' || value === 'auto') return value
+  if (value === 'assemblyai' || value === 'deepgram' || value === 'openai' || value === 'auto') return value
   return 'auto'
 }
 
@@ -42,7 +43,12 @@ export function pickTranscriptProvider(language: string | undefined): Transcript
 /**
  * Native-capture STT pick. Explicit preference wins when that engine is
  * keyed and (for Assembly) language-supported. Otherwise language routing,
- * then whichever key exists.
+ * then whichever legacy STT key exists.
+ *
+ * OpenAI uses the same direct/native slot that historically meant Deepgram;
+ * TranscriptionService inspects the explicit preference and delegates that
+ * slot to OpenAITranscriptionService. This keeps AudioManager's recording
+ * lifecycle unchanged while adding the third engine.
  */
 export function chooseNativeSttStrategy(opts: {
   language: string | undefined
@@ -52,6 +58,10 @@ export function chooseNativeSttStrategy(opts: {
 }): NativeSttStrategy {
   const preferred = parseSttProviderPreference(opts.preferredProvider)
   const assemblyUsable = assemblyaiSupportsLanguage(opts.language) && opts.hasAssemblyKey
+
+  if (preferred === 'openai') {
+    return 'deepgram'
+  }
 
   if (preferred === 'deepgram') {
     if (opts.hasDeepgramKey) return 'deepgram'
@@ -75,7 +85,10 @@ export function chooseNativeSttStrategy(opts: {
 
 export function effectiveSttEngine(
   opts: Parameters<typeof chooseNativeSttStrategy>[0],
-): 'assemblyai' | 'deepgram' | 'none' {
+): 'assemblyai' | 'deepgram' | 'openai' | 'none' {
+  const preferred = parseSttProviderPreference(opts.preferredProvider)
+  if (preferred === 'openai') return 'openai'
+
   const strategy = chooseNativeSttStrategy(opts)
   if (strategy === 'assembly-retry') return 'assemblyai'
   if (strategy === 'deepgram') return 'deepgram'
