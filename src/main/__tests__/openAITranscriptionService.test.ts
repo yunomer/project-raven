@@ -14,9 +14,12 @@ vi.mock('../services/sessionManager', () => ({
   },
 }))
 
-import { resamplePcm16Mono } from '../services/openAITranscriptionService'
+import {
+  pcm16DurationMs,
+  resamplePcm16Mono,
+} from '../services/openAITranscriptionService'
 
-describe('OpenAI realtime transcription audio resampling', () => {
+describe('OpenAI realtime transcription audio handling', () => {
   it('converts Raven 16 kHz PCM16 to OpenAI 24 kHz PCM16', () => {
     const input = Buffer.alloc(160 * 2)
     for (let i = 0; i < 160; i++) {
@@ -39,5 +42,11 @@ describe('OpenAI realtime transcription audio resampling', () => {
 
   it('handles empty PCM buffers without producing invalid samples', () => {
     expect(resamplePcm16Mono(Buffer.alloc(0), 16_000, 24_000)).toEqual(Buffer.alloc(0))
+  })
+
+  it('computes PCM16 duration so manual commits never send undersized buffers', () => {
+    expect(pcm16DurationMs(Buffer.alloc(24_000 * 2), 24_000)).toBe(1_000)
+    expect(pcm16DurationMs(Buffer.alloc(2_400 * 2), 24_000)).toBe(100)
+    expect(pcm16DurationMs(Buffer.alloc(0), 24_000)).toBe(0)
   })
 })
