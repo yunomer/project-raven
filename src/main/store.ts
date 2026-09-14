@@ -299,7 +299,9 @@ export function saveApiKeys(
 }
 
 export function hasApiKeys(): boolean {
-  const hasStt = !!getApiKey('deepgramApiKey') || !!getApiKey('assemblyaiApiKey') || !!getApiKey('openaiApiKey');
+  const sttProvider = store.get('sttProvider') || 'auto';
+  const hasOpenAiStt = sttProvider === 'openai' && !!getApiKey('openaiApiKey');
+  const hasStt = !!getApiKey('deepgramApiKey') || !!getApiKey('assemblyaiApiKey') || hasOpenAiStt;
   const provider = store.get('aiProvider') || 'anthropic';
   const hasAiKey = provider === 'openai'
     ? !!getApiKey('openaiApiKey')
