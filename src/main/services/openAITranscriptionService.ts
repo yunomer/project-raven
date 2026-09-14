@@ -5,6 +5,10 @@
  * 24 kHz PCM, so audio is resampled before it is appended to the session.
  * Mic and system audio use independent WebSocket sessions so Raven can keep
  * deterministic You/Them labels without diarization.
+ *
+ * gpt-live-transcribe does not support server-side turn detection. Raven uses
+ * manual audio-buffer commits instead, which both finalizes transcript turns
+ * and keeps the implementation independent of a second VAD dependency.
  */
 
 import { BrowserWindow } from 'electron'
@@ -23,6 +27,10 @@ const MAX_RECONNECT_ATTEMPTS = 3
 const RECONNECT_DELAY_MS = 1_000
 const RECONNECT_BUFFER_MAX_CHUNKS = 50
 const MAX_TRANSCRIPT_ENTRIES = 5_000
+const SESSION_SETUP_TIMEOUT_MS = 10_000
+const MANUAL_COMMIT_INTERVAL_MS = 2_500
+const MIN_COMMIT_AUDIO_MS = 100
+const STOP_FLUSH_WAIT_MS = 1_200
 
 type AudioSource = 'mic' | 'system'
 
@@ -37,12 +45,15 @@ interface TranscriptEntry {
 
 interface ConnectionState {
   ws: WebSocket | null
+  /** True only after OpenAI acknowledges our session.update. */
   isConnected: boolean
   currentInterim: string
   sendCount: number
   reconnectAttempts: number
   pendingAudio: Buffer[]
   interimByItem: Map<string, string>
+  /** Duration currently sitting in OpenAI's uncommitted input buffer. */
+  bufferedAudioMs: number
 }
 
 function createConnectionState(): ConnectionState {
@@ -54,6 +65,7 @@ function createConnectionState(): ConnectionState {
     reconnectAttempts: 0,
     pendingAudio: [],
     interimByItem: new Map(),
+    bufferedAudioMs: 0,
   }
 }
 
@@ -90,6 +102,12 @@ export function resamplePcm16Mono(
   return output
 }
 
+/** Duration of mono PCM16 audio represented by a buffer. */
+export function pcm16DurationMs(buffer: Buffer, sampleRate: number): number {
+  if (sampleRate <= 0 || buffer.length < 2) return 0
+  return (Math.floor(buffer.length / 2) / sampleRate) * 1_000
+}
+
 function buildVocabulary(): string[] {
   const raw = (getSetting('vocabulary') as string) || ''
   const userTerms = raw.split(',').map((term) => term.trim()).filter(Boolean)
@@ -97,7 +115,6 @@ function buildVocabulary(): string[] {
   const terms: string[] = []
 
   for (const rawTerm of ['Raven', ...userTerms]) {
-    // OpenAI rejects keywords containing angle brackets or line breaks.
     const term = rawTerm.replace(/[<>\r\n]/g, '').trim().slice(0, 80)
     if (!term) continue
     const key = term.toLowerCase()
@@ -112,7 +129,7 @@ function buildVocabulary(): string[] {
 
 function normalizeLanguage(language: string): string | null {
   if (!language || language === 'multi') return null
-  return language.toLowerCase().replace('_', '-')
+  return language.toLowerCase().split(/[-_]/)[0] || null
 }
 
 export class OpenAITranscriptionService {
@@ -150,7 +167,7 @@ export class OpenAITranscriptionService {
 
     if (!micResult.success && !systemResult.success) {
       this.isActive = false
-      return { success: false, error: 'Failed to connect to OpenAI realtime transcription' }
+      return { success: false, error: 'Failed to configure OpenAI realtime transcription' }
     }
 
     return { success: true }
@@ -177,27 +194,28 @@ export class OpenAITranscriptionService {
           settled = true
           resolve(result)
         }
+
         const timeout = setTimeout(() => {
-          log.error(`${source} OpenAI WebSocket connection timed out after 10s`)
-          try { state.ws?.close() } catch { /* ignore */ }
+          log.error(`${source} OpenAI transcription session setup timed out after ${SESSION_SETUP_TIMEOUT_MS}ms`)
+          try { state.ws?.close(1000) } catch { /* ignore */ }
           finish({ success: false })
-        }, 10_000)
+        }, SESSION_SETUP_TIMEOUT_MS)
 
         state.ws!.onopen = () => {
-          log.info(`${source} OpenAI WebSocket connected`)
-          state.isConnected = true
-          state.reconnectAttempts = 0
+          log.info(`${source} OpenAI WebSocket opened; configuring transcription session`)
 
           const language = normalizeLanguage((getSetting('transcriptionLanguage') as string) || 'en')
           const keywords = buildVocabulary()
           const transcription: Record<string, unknown> = {
             model: OPENAI_TRANSCRIPTION_MODEL,
             keywords,
-            delay: 'low',
             prompt: 'A live meeting or interview. Preserve names, technical terms, acronyms, numbers, and punctuation accurately.',
           }
           if (language) transcription.languages = [language]
 
+          // gpt-live-transcribe is a realtime-only STT model and explicitly
+          // does not support server_vad/semantic_vad. Omitting turn_detection
+          // means Raven must commit the input audio buffer itself.
           state.ws!.send(JSON.stringify({
             type: 'session.update',
             session: {
@@ -206,25 +224,39 @@ export class OpenAITranscriptionService {
                 input: {
                   format: { type: 'audio/pcm', rate: OPENAI_SAMPLE_RATE },
                   transcription,
-                  turn_detection: {
-                    type: 'server_vad',
-                    threshold: 0.5,
-                    prefix_padding_ms: 300,
-                    silence_duration_ms: 500,
-                  },
                 },
               },
             },
           }))
-
-          clearTimeout(timeout)
-          this.broadcastStatus(`${source}-connected`)
-          finish({ success: true })
         }
 
         state.ws!.onmessage = (event: { data: unknown }) => {
           try {
-            const data = JSON.parse(typeof event.data === 'string' ? event.data : String(event.data))
+            const data = JSON.parse(typeof event.data === 'string' ? event.data : String(event.data)) as Record<string, unknown>
+            const type = typeof data.type === 'string' ? data.type : ''
+
+            // A TCP/WebSocket connection is not enough. Audio must not be sent
+            // until OpenAI accepts the transcription configuration.
+            if (type === 'session.updated' && !state.isConnected) {
+              clearTimeout(timeout)
+              state.isConnected = true
+              state.reconnectAttempts = 0
+              log.info(`${source} OpenAI transcription session ready`)
+              this.broadcastStatus(`${source}-connected`)
+              this.flushPendingAudio(state, source)
+              finish({ success: true })
+              return
+            }
+
+            if (type === 'error' && !state.isConnected) {
+              clearTimeout(timeout)
+              const error = data.error as { message?: string } | undefined
+              log.error(`${source} OpenAI session configuration failed:`, error?.message || data)
+              try { state.ws?.close(1000) } catch { /* ignore */ }
+              finish({ success: false })
+              return
+            }
+
             this.handleServerEvent(data, source)
           } catch (err) {
             log.error(`${source} OpenAI message parse error:`, err)
@@ -237,14 +269,17 @@ export class OpenAITranscriptionService {
           finish({ success: false })
         }
 
-        state.ws!.onclose = (event: { code?: number; reason?: string }) => {
+        state.ws!.onclose = (event: { code?: number; reason?: unknown }) => {
           clearTimeout(timeout)
           const code = event?.code ?? 'unknown'
-          const reason = event?.reason ?? 'no reason'
+          const reason = event?.reason == null ? 'no reason' : String(event.reason)
           log.warn(`${source} OpenAI WebSocket closed (code=${code}, reason="${reason}")`)
+          const wasReady = state.isConnected
           state.isConnected = false
           state.ws = null
-          if (this.isActive && code !== 1000) void this.attemptReconnect(source)
+          state.bufferedAudioMs = 0
+          if (!wasReady) finish({ success: false })
+          if (this.isActive && code !== 1000 && wasReady) void this.attemptReconnect(source)
         }
       })
     } catch (err) {
@@ -273,10 +308,17 @@ export class OpenAITranscriptionService {
       const itemId = typeof data.item_id === 'string' ? data.item_id : ''
       const state = this.stateFor(source)
       if (itemId) state.interimByItem.delete(itemId)
-      state.currentInterim = state.interimByItem.size > 0
-        ? Array.from(state.interimByItem.values()).at(-1) || ''
-        : ''
-      if (transcript) this.handleFinalTranscript(transcript, source)
+      const remainingInterims = Array.from(state.interimByItem.values())
+      state.currentInterim = remainingInterims.length > 0 ? remainingInterims[remainingInterims.length - 1] : ''
+      if (transcript) {
+        log.debug(`${source} OpenAI final transcript: "${transcript.slice(0, 120)}"`)
+        this.handleFinalTranscript(transcript, source)
+      }
+      return
+    }
+
+    if (type === 'input_audio_buffer.committed') {
+      log.debug(`${source} OpenAI audio buffer committed`)
       return
     }
 
@@ -291,9 +333,11 @@ export class OpenAITranscriptionService {
     const now = Date.now()
     const state = this.stateFor(source)
     const lastEntry = this.transcriptEntries[this.transcriptEntries.length - 1]
-    const shouldMerge = lastEntry
+    const shouldMerge = Boolean(
+      lastEntry
       && lastEntry.speaker === speaker
-      && (now - lastEntry.timestamp) < TRANSCRIPT_MERGE_WINDOW_MS
+      && (now - lastEntry.timestamp) < TRANSCRIPT_MERGE_WINDOW_MS,
+    )
 
     if (shouldMerge && lastEntry) {
       lastEntry.text = `${lastEntry.text} ${text}`
@@ -366,28 +410,65 @@ export class OpenAITranscriptionService {
       return
     }
 
-    if (state.pendingAudio.length > 0) {
-      const pending = state.pendingAudio.splice(0)
-      for (const chunk of pending) this.sendChunk(state, chunk, source)
-    }
+    this.flushPendingAudio(state, source)
     this.sendChunk(state, raw, source)
+  }
+
+  private flushPendingAudio(state: ConnectionState, source: AudioSource): void {
+    if (!state.ws || !state.isConnected || state.pendingAudio.length === 0) return
+    const pending = state.pendingAudio.splice(0)
+    log.info(`${source} flushing ${pending.length} buffered chunks after OpenAI session became ready`)
+    for (const chunk of pending) {
+      if (!state.ws || !state.isConnected) break
+      this.sendChunk(state, chunk, source)
+    }
   }
 
   private sendChunk(state: ConnectionState, raw: Buffer, source: AudioSource): void {
     if (!state.ws || !state.isConnected) return
+
     try {
       const pcm24k = resamplePcm16Mono(raw)
       if (pcm24k.length === 0) return
+
       state.sendCount++
       state.ws.send(JSON.stringify({
         type: 'input_audio_buffer.append',
         audio: pcm24k.toString('base64'),
       }))
+      state.bufferedAudioMs += pcm16DurationMs(pcm24k, OPENAI_SAMPLE_RATE)
+
       if (state.sendCount <= 3 || state.sendCount % 200 === 0) {
-        log.debug(`${source} OpenAI audio send #${state.sendCount}: ${raw.length}B -> ${pcm24k.length}B`)
+        log.debug(
+          `${source} OpenAI audio send #${state.sendCount}: ${raw.length}B -> ${pcm24k.length}B, `
+          + `uncommitted=${Math.round(state.bufferedAudioMs)}ms`,
+        )
+      }
+
+      if (state.bufferedAudioMs >= MANUAL_COMMIT_INTERVAL_MS) {
+        this.commitAudioBuffer(state, source, 'interval')
       }
     } catch (err) {
       log.error(`${source} OpenAI audio send error:`, err)
+    }
+  }
+
+  private commitAudioBuffer(
+    state: ConnectionState,
+    source: AudioSource,
+    reason: 'interval' | 'stop',
+  ): boolean {
+    if (!state.ws || !state.isConnected || state.bufferedAudioMs < MIN_COMMIT_AUDIO_MS) return false
+
+    try {
+      const durationMs = state.bufferedAudioMs
+      state.ws.send(JSON.stringify({ type: 'input_audio_buffer.commit' }))
+      state.bufferedAudioMs = 0
+      log.debug(`${source} OpenAI audio commit (${reason}, ${Math.round(durationMs)}ms)`)
+      return true
+    } catch (err) {
+      log.error(`${source} OpenAI audio commit error:`, err)
+      return false
     }
   }
 
@@ -419,38 +500,45 @@ export class OpenAITranscriptionService {
   async stop(): Promise<void> {
     this.isActive = false
     await Promise.all([
-      this.stopConnection(this.micState),
-      this.stopConnection(this.systemState),
+      this.stopConnection(this.micState, 'mic'),
+      this.stopConnection(this.systemState, 'system'),
     ])
     this.micState.reconnectAttempts = 0
     this.systemState.reconnectAttempts = 0
   }
 
-  private async stopConnection(state: ConnectionState): Promise<void> {
+  private async stopConnection(state: ConnectionState, source: AudioSource): Promise<void> {
     if (!state.ws) {
-      state.isConnected = false
-      state.currentInterim = ''
+      this.resetConnectionState(state)
       return
     }
 
     try {
       if (state.isConnected) {
-        // Server VAD normally commits turns. This captures a final partial turn
-        // when the user stops Raven while someone is still speaking.
-        state.ws.send(JSON.stringify({ type: 'input_audio_buffer.commit' }))
-        await new Promise((resolve) => setTimeout(resolve, 350))
+        const hadInterim = state.currentInterim.trim().length > 0
+        const committed = this.commitAudioBuffer(state, source, 'stop')
+        if (committed || hadInterim) {
+          // Give the low-latency model time to emit the final completed event
+          // before the socket disappears and SessionManager saves the meeting.
+          await new Promise((resolve) => setTimeout(resolve, STOP_FLUSH_WAIT_MS))
+        }
       }
       state.ws.close(1000)
     } catch (err) {
-      log.error('OpenAI close error:', err)
+      log.error(`${source} OpenAI close error:`, err)
       try { state.ws.close() } catch { /* ignore */ }
     }
 
+    this.resetConnectionState(state)
+  }
+
+  private resetConnectionState(state: ConnectionState): void {
     state.ws = null
     state.isConnected = false
     state.currentInterim = ''
     state.interimByItem.clear()
     state.pendingAudio = []
+    state.bufferedAudioMs = 0
   }
 
   getFullTranscript(): string {
@@ -471,8 +559,12 @@ export class OpenAITranscriptionService {
 
   getTranscriptBySource(source: 'mic' | 'system' | 'all'): string {
     const displayName = (getSetting('displayName') as string) || 'You'
-    const filtered = source === 'all' ? this.transcriptEntries : this.transcriptEntries.filter((entry) => entry.source === source)
-    return filtered.map((entry) => `${entry.speaker === 'you' ? displayName : 'Them'}: ${entry.text}`).join('\n')
+    const filtered = source === 'all'
+      ? this.transcriptEntries
+      : this.transcriptEntries.filter((entry) => entry.source === source)
+    return filtered
+      .map((entry) => `${entry.speaker === 'you' ? displayName : 'Them'}: ${entry.text}`)
+      .join('\n')
   }
 
   clearTranscript(): void {
@@ -485,7 +577,9 @@ export class OpenAITranscriptionService {
 
   private getFullTranscriptText(): string {
     const displayName = (getSetting('displayName') as string) || 'You'
-    return this.transcriptEntries.map((entry) => `${entry.speaker === 'you' ? displayName : 'Them'}: ${entry.text}`).join('\n')
+    return this.transcriptEntries
+      .map((entry) => `${entry.speaker === 'you' ? displayName : 'Them'}: ${entry.text}`)
+      .join('\n')
   }
 
   private broadcastTranscript(data: {
@@ -495,12 +589,17 @@ export class OpenAITranscriptionService {
     interims?: { mic: string; system: string }
   }): void {
     try {
-      if (this.overlayWindow && !this.overlayWindow.isDestroyed()) this.overlayWindow.webContents.send('transcription:update', data)
+      if (this.overlayWindow && !this.overlayWindow.isDestroyed()) {
+        this.overlayWindow.webContents.send('transcription:update', data)
+      }
     } catch (err) {
       log.error('Broadcast to overlay failed:', err)
     }
+
     try {
-      if (this.dashboardWindow && !this.dashboardWindow.isDestroyed()) this.dashboardWindow.webContents.send('transcription:update', data)
+      if (this.dashboardWindow && !this.dashboardWindow.isDestroyed()) {
+        this.dashboardWindow.webContents.send('transcription:update', data)
+      }
     } catch (err) {
       log.error('Broadcast to dashboard failed:', err)
     }
@@ -509,10 +608,15 @@ export class OpenAITranscriptionService {
   private broadcastStatus(status: string): void {
     const payload = { status }
     try {
-      if (this.overlayWindow && !this.overlayWindow.isDestroyed()) this.overlayWindow.webContents.send('transcription:status', payload)
+      if (this.overlayWindow && !this.overlayWindow.isDestroyed()) {
+        this.overlayWindow.webContents.send('transcription:status', payload)
+      }
     } catch { /* ignore */ }
+
     try {
-      if (this.dashboardWindow && !this.dashboardWindow.isDestroyed()) this.dashboardWindow.webContents.send('transcription:status', payload)
+      if (this.dashboardWindow && !this.dashboardWindow.isDestroyed()) {
+        this.dashboardWindow.webContents.send('transcription:status', payload)
+      }
     } catch { /* ignore */ }
   }
 }
