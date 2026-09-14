@@ -56,7 +56,7 @@ export class OpenAIProvider implements AIProvider {
     try {
       const stream = await client.chat.completions.create({
         model: this.model,
-        max_tokens: params.maxTokens ?? streamMaxTokensFor('openai', this.model),
+        max_completion_tokens: params.maxTokens ?? streamMaxTokensFor('openai', this.model),
         messages: openaiMessages,
         stream: true,
         ...this.effortParams(),
@@ -100,7 +100,7 @@ export class OpenAIProvider implements AIProvider {
 
     const response = await client.chat.completions.create({
       model: this.model,
-      max_tokens: streamMaxTokensFor('openai', this.model),
+      max_completion_tokens: streamMaxTokensFor('openai', this.model),
       messages,
       ...this.effortParams(),
     });

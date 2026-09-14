@@ -43,7 +43,7 @@ describe('OpenAIProvider', () => {
       expect(mockCreate).toHaveBeenCalledWith(
         expect.objectContaining({
           model: 'gpt-5.2',
-          max_tokens: 128000,
+          max_completion_tokens: 128000,
           messages: [{ role: 'user', content: 'Generate something' }],
         })
       )
@@ -62,7 +62,7 @@ describe('OpenAIProvider', () => {
 
       expect(mockCreate).toHaveBeenCalledWith(
         expect.objectContaining({
-          max_tokens: 128000,
+          max_completion_tokens: 128000,
           messages: [
             { role: 'system', content: 'Be concise' },
             { role: 'user', content: 'Test' },
@@ -97,7 +97,7 @@ describe('OpenAIProvider', () => {
       await provider.generateShort({ prompt: 'summarize', maxTokens: 2000 })
       expect(mockCreate).toHaveBeenCalledWith(
         expect.objectContaining({
-          max_tokens: 128000,
+          max_completion_tokens: 128000,
           reasoning_effort: 'max',
         }),
       )
@@ -166,12 +166,12 @@ describe('OpenAIProvider', () => {
       expect(mockCreate).toHaveBeenCalledWith(
         expect.objectContaining({
           stream: true,
-          max_tokens: 512,
+          max_completion_tokens: 512,
         })
       )
     })
 
-    it('defaults omitted max_tokens to the official 128k model max', async () => {
+    it('defaults omitted max_completion_tokens to the official 128k model max', async () => {
       mockCreate.mockResolvedValueOnce({
         [Symbol.asyncIterator]: async function* () {},
       })
@@ -182,7 +182,7 @@ describe('OpenAIProvider', () => {
       )
 
       expect(mockCreate).toHaveBeenCalledWith(
-        expect.objectContaining({ max_tokens: 128000 })
+        expect.objectContaining({ max_completion_tokens: 128000 })
       )
     })
 
