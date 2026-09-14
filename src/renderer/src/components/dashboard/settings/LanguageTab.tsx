@@ -27,6 +27,7 @@ export function LanguageTab() {
   const [sttProvider, setSttProvider] = useState<SttProviderPreference>('auto')
   const [hasAssemblyKey, setHasAssemblyKey] = useState(false)
   const [hasDeepgramKey, setHasDeepgramKey] = useState(false)
+  const [hasOpenAIKey, setHasOpenAIKey] = useState(false)
   const [vocabulary, setVocabulary] = useState('')
   const [vocabularySaveState, setVocabularySaveState] = useState<'idle' | 'saving' | 'saved'>('idle')
   const [transcriptionDropdownOpen, setTranscriptionDropdownOpen] = useState(false)
@@ -44,12 +45,14 @@ export function LanguageTab() {
         const stt = parseSttProviderPreference(await window.raven.storeGet('sttProvider'))
         const dgKey = (await window.raven.storeGet('deepgramApiKey')) as string
         const aaiKey = (await window.raven.storeGet('assemblyaiApiKey')) as string
+        const openaiKey = (await window.raven.storeGet('openaiApiKey')) as string
         if (tLang) setTranscriptionLang(tLang)
         if (oLang) setOutputLang(oLang)
         if (vocab) setVocabulary(vocab)
         setSttProvider(stt)
         setHasDeepgramKey(!!dgKey?.trim())
         setHasAssemblyKey(!!aaiKey?.trim())
+        setHasOpenAIKey(!!openaiKey?.trim())
       } catch (error) {
         log.error('Failed to load language settings:', error)
       }
@@ -163,6 +166,7 @@ export function LanguageTab() {
   const assemblyLangOk = assemblyaiSupportsLanguage(transcriptionLang)
   const assemblySelectable = assemblyLangOk && hasAssemblyKey
   const deepgramSelectable = hasDeepgramKey
+  const openAISelectable = hasOpenAIKey
   const willUse = effectiveSttEngine({
     language: transcriptionLang,
     hasAssemblyKey,
@@ -170,7 +174,13 @@ export function LanguageTab() {
     preferredProvider: sttProvider,
   })
   const willUseLabel =
-    willUse === 'assemblyai' ? 'AssemblyAI' : willUse === 'deepgram' ? 'Deepgram' : 'no engine (add an API key)'
+    willUse === 'assemblyai'
+      ? 'AssemblyAI'
+      : willUse === 'deepgram'
+        ? 'Deepgram'
+        : willUse === 'openai'
+          ? 'OpenAI'
+          : 'no engine (add an API key)'
 
   return (
     <div className="space-y-6 max-w-xl">
@@ -254,7 +264,16 @@ export function LanguageTab() {
             selected={sttProvider}
             onSelect={handleSttProviderChange}
             title="Automatic"
-            description={`AssemblyAI for ${ASSEMBLYAI_LIVE_LANGUAGE_LABELS}. Deepgram for auto-detect and every other language.`}
+            description={`AssemblyAI for ${ASSEMBLYAI_LIVE_LANGUAGE_LABELS}. Deepgram for auto-detect and every other language. OpenAI is opt-in.`}
+          />
+          <SttRadio
+            value="openai"
+            selected={sttProvider}
+            onSelect={handleSttProviderChange}
+            disabled={!openAISelectable}
+            title="OpenAI"
+            description="gpt-live-transcribe. Low-latency realtime transcription using your existing OpenAI key."
+            hint={!hasOpenAIKey ? 'Add an OpenAI key in API Keys to use this engine.' : undefined}
           />
           <SttRadio
             value="assemblyai"
@@ -284,6 +303,7 @@ export function LanguageTab() {
 
         <p className="text-xs text-gray-500">
           Next recording will use <span className="font-medium text-gray-700">{willUseLabel}</span>
+          {sttProvider === 'openai' && willUse === 'openai' && ' — separate mic and system streams use gpt-live-transcribe.'}
           {sttProvider === 'assemblyai' && willUse === 'deepgram' && ' (AssemblyAI is not available for this language).'}
           {sttProvider !== 'auto' && willUse === 'assemblyai' && ' — falls back to Deepgram if AssemblyAI cannot connect.'}
         </p>
