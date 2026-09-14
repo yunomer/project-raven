@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # Build the webrtcdsp GStreamer plugin from gst-plugins-bad source.
 # This plugin provides webrtcdsp and webrtcechoprobe elements for AEC.
@@ -9,20 +9,20 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEPS_DIR="$SCRIPT_DIR/deps"
 PLUGIN_DIR="$DEPS_DIR/lib/gstreamer-1.0"
-BUILD_DIR="/tmp/webrtcdsp-plugin-build"
+BUILD_DIR="${TMPDIR:-/tmp}/raven-webrtcdsp-plugin-build"
 
 GST_VERSION=$(pkg-config --modversion gstreamer-1.0)
 echo "Building webrtcdsp plugin for GStreamer $GST_VERSION"
 
-# Check that webrtc-audio-processing static libs exist
+# Make direct invocation safe too: if the static WebRTC dependency is missing,
+# bootstrap it instead of sending the caller back to build-deps.sh in a loop.
 if [ ! -f "$DEPS_DIR/lib/libwebrtc-audio-processing-1.a" ]; then
-    echo "ERROR: libwebrtc-audio-processing not found in $DEPS_DIR/lib/"
-    echo "Run the original build-deps.sh to build it first."
-    exit 1
+    echo "WebRTC Audio Processing dependency not found; bootstrapping it first..."
+    bash "$SCRIPT_DIR/build-webrtc-audio-processing.sh"
 fi
 
-# Clone GStreamer monorepo (shallow, matching version)
-SRC_DIR="/tmp/gst-mono-${GST_VERSION}"
+# Clone GStreamer monorepo (shallow, matching the locally installed version)
+SRC_DIR="${TMPDIR:-/tmp}/raven-gst-mono-${GST_VERSION}"
 if [ ! -d "$SRC_DIR/subprojects/gst-plugins-bad/ext/webrtcdsp" ]; then
     echo "Cloning GStreamer $GST_VERSION source..."
     rm -rf "$SRC_DIR"
@@ -34,6 +34,7 @@ WEBRTCDSP_SRC="$SRC_DIR/subprojects/gst-plugins-bad/ext/webrtcdsp"
 echo "Source files: $WEBRTCDSP_SRC"
 
 # Create build dir and config.h
+rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 cat > "$BUILD_DIR/config.h" << EOF
 #ifndef __GST_WEBRTCDSP_CONFIG_H__
@@ -47,7 +48,8 @@ cat > "$BUILD_DIR/config.h" << EOF
 #endif
 EOF
 
-# Compile
+# Compile. WebRTC Audio Processing's Meson build creates several internal
+# static archives; build-webrtc-audio-processing.sh copies them into deps/lib.
 echo "Compiling webrtcdsp plugin..."
 c++ -std=c++17 -shared -fPIC \
     -DHAVE_CONFIG_H \
@@ -74,11 +76,13 @@ cp "$BUILD_DIR/libgstwebrtcdsp.dylib" "$PLUGIN_DIR/"
 
 echo "Plugin installed to $PLUGIN_DIR/libgstwebrtcdsp.dylib"
 
-# Verify
-GST_PLUGIN_PATH="$PLUGIN_DIR" gst-inspect-1.0 webrtcdsp > /dev/null 2>&1 \
-    && echo "Verification: webrtcdsp element loads OK" \
-    || echo "WARNING: webrtcdsp element failed to load"
+# Verify and fail loudly if the binary exists but cannot resolve its dependencies.
+GST_PLUGIN_PATH="$PLUGIN_DIR${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}" \
+  gst-inspect-1.0 webrtcdsp >/dev/null 2>&1 \
+  && echo "Verification: webrtcdsp element loads OK" \
+  || { echo "ERROR: webrtcdsp element failed to load"; exit 1; }
 
-GST_PLUGIN_PATH="$PLUGIN_DIR" gst-inspect-1.0 webrtcechoprobe > /dev/null 2>&1 \
-    && echo "Verification: webrtcechoprobe element loads OK" \
-    || echo "WARNING: webrtcechoprobe element failed to load"
+GST_PLUGIN_PATH="$PLUGIN_DIR${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}" \
+  gst-inspect-1.0 webrtcechoprobe >/dev/null 2>&1 \
+  && echo "Verification: webrtcechoprobe element loads OK" \
+  || { echo "ERROR: webrtcechoprobe element failed to load"; exit 1; }

@@ -1,9 +1,22 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEPS_DIR="$SCRIPT_DIR/deps"
 PLUGIN_DIR="$DEPS_DIR/lib/gstreamer-1.0"
+
+need_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "ERROR: '$1' is required for Raven AEC."
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      echo "Install prerequisites with: brew install gstreamer pkg-config meson ninja"
+    fi
+    exit 1
+  fi
+}
+
+need_command pkg-config
+need_command gst-inspect-1.0
 
 echo "=== Verifying GStreamer AEC dependencies ==="
 
@@ -42,6 +55,13 @@ if ! pkg-config --exists gstreamer-bad-audio-1.0; then
 fi
 echo "  GStreamer bad-audio: OK"
 
+# Homebrew GStreamer does not ship webrtcdsp because it depends on WebRTC Audio
+# Processing. Bootstrap the pinned static WebRTC library (and its internal
+# static archives) before compiling the plugin. The helper is idempotent and
+# returns immediately when deps/ is already complete.
+echo ""
+bash "$SCRIPT_DIR/build-webrtc-audio-processing.sh"
+
 # Check for our custom webrtcdsp plugin
 if [ -f "$PLUGIN_DIR/libgstwebrtcdsp.dylib" ] || [ -f "$PLUGIN_DIR/libgstwebrtcdsp.so" ]; then
     echo "  webrtcdsp plugin: OK (custom-built in deps/)"
@@ -50,9 +70,25 @@ else
     echo "  webrtcdsp plugin not found in $PLUGIN_DIR"
     echo "  Building from gst-plugins-bad source..."
     echo ""
-    "$SCRIPT_DIR/build-webrtcdsp-plugin.sh"
+    bash "$SCRIPT_DIR/build-webrtcdsp-plugin.sh"
 fi
+
+# Do not report success if the plugin file exists but cannot actually be loaded.
+GST_PLUGIN_PATH="$PLUGIN_DIR${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}" \
+  gst-inspect-1.0 webrtcdsp >/dev/null 2>&1 || {
+    echo "ERROR: custom webrtcdsp plugin was built but GStreamer could not load it."
+    echo "Run: GST_PLUGIN_PATH=\"$PLUGIN_DIR\" gst-inspect-1.0 webrtcdsp"
+    exit 1
+  }
+
+GST_PLUGIN_PATH="$PLUGIN_DIR${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}" \
+  gst-inspect-1.0 webrtcechoprobe >/dev/null 2>&1 || {
+    echo "ERROR: custom webrtcechoprobe element could not be loaded."
+    exit 1
+  }
 
 echo ""
 echo "=== All GStreamer AEC dependencies satisfied ==="
-echo "  Run 'npx cmake-js compile --CDCMAKE_BUILD_TYPE=Release' from src/native/aec/ to build."
+echo "  WebRTC Audio Processing: OK"
+echo "  webrtcdsp: OK"
+echo "  webrtcechoprobe: OK"
